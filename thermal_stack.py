@@ -73,6 +73,17 @@ GENERATION_COLUMNS_BY_FUEL = {
     "Oil": "gen_oil_act",
 }
 
+DEMAND_BASIS_CONSUMPTION = "consumption"
+DEMAND_BASIS_RESIDUAL_LOAD = "residual_load"
+DEMAND_BASIS_THERMAL_RESIDUAL = "thermal_residual"
+DEMAND_BASIS_CHOICES = (
+    DEMAND_BASIS_CONSUMPTION,
+    DEMAND_BASIS_RESIDUAL_LOAD,
+    DEMAND_BASIS_THERMAL_RESIDUAL,
+)
+
+KANSAI_FENCE_AREAS = ("Hokuriku", "Kansai", "Chubu")
+
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
@@ -110,6 +121,54 @@ class ThermalStackResult:
     delivery_month: pd.Timestamp
     capacity_summary: dict
     export_path: Path | None
+
+
+@dataclass(frozen=True)
+class PriceSetterConfig:
+    """One price-setter scenario: region grouping, spot reference and demand basis."""
+    name: str
+    areas: tuple[str, ...]
+    spot_area: str
+    demand_basis: str = DEMAND_BASIS_CONSUMPTION
+
+    def __post_init__(self) -> None:
+        if self.demand_basis not in DEMAND_BASIS_CHOICES:
+            raise ValueError(
+                f"Unsupported demand_basis {self.demand_basis!r}. "
+                f"Expected one of {DEMAND_BASIS_CHOICES}."
+            )
+        if self.spot_area not in REGION_SPOT_COLUMNS:
+            raise ValueError(f"Unknown spot_area {self.spot_area!r}.")
+        for area in self.areas:
+            if area not in REGION_SPOT_COLUMNS:
+                raise ValueError(f"Unknown market area {area!r}.")
+
+
+def default_price_setter_configs(
+    include_kansai_fence: bool = True,
+    include_tokyo: bool = False,
+) -> list[PriceSetterConfig]:
+    """Return default parallel price-setter configurations."""
+    region_groups: list[tuple[str, tuple[str, ...], str]] = [
+        ("Kansai", ("Kansai",), "Kansai"),
+    ]
+    if include_kansai_fence:
+        region_groups.append(("Kansai+Hokuriku+Chubu", KANSAI_FENCE_AREAS, "Kansai"))
+    if include_tokyo:
+        region_groups.append(("Tokyo", ("Tokyo",), "Tokyo"))
+
+    configs: list[PriceSetterConfig] = []
+    for label, areas, spot_area in region_groups:
+        for demand_basis in DEMAND_BASIS_CHOICES:
+            configs.append(
+                PriceSetterConfig(
+                    name=f"{label} | {demand_basis}",
+                    areas=areas,
+                    spot_area=spot_area,
+                    demand_basis=demand_basis,
+                )
+            )
+    return configs
 
 def _require_columns(frame: pd.DataFrame, required_columns: Iterable[str], frame_name: str) -> None:
     """Raise error when required columns missing."""
@@ -934,11 +993,65 @@ def convert_spot_to_eur_mwh(spot: pd.DataFrame, fuel_cocktail: pd.DataFrame, reg
     return converted
 
 
+def _align_series_index(series: pd.Series, spot_index: pd.DatetimeIndex) -> pd.Series:
+    """Align one series index to the spot index timezone."""
+    aligned = series.copy()
+    aligned.index = pd.to_datetime(aligned.index)
+    if aligned.index.tz is None and spot_index.tz is not None:
+        aligned.index = aligned.index.tz_localize(spot_index.tz)
+    return aligned
+
+
+def _aggregate_regional_series_mw(
+    df_30min: pd.DataFrame,
+    areas: Iterable[str],
+    column: str,
+) -> pd.Series:
+    """Sum one 30-minute column across multiple market areas."""
+    total: pd.Series | None = None
+    for area in areas:
+        key = (area, column)
+        if key not in df_30min.columns:
+            raise ValueError(f"30-minute data has no {column!r} column for area {area!r}.")
+        series = pd.to_numeric(df_30min[key], errors="coerce")
+        total = series if total is None else total.add(series, fill_value=0)
+    if total is None:
+        raise ValueError("At least one market area is required.")
+    return total
+
+
+def compute_demand_mw(
+    df_30min: pd.DataFrame,
+    areas: str | Iterable[str],
+    demand_basis: str = DEMAND_BASIS_CONSUMPTION,
+) -> pd.Series:
+    """Compute demand MW for one area or a combined regional grouping."""
+    area_list = [areas] if isinstance(areas, str) else list(areas)
+    consumption = _aggregate_regional_series_mw(df_30min, area_list, "cons_act")
+
+    if demand_basis == DEMAND_BASIS_CONSUMPTION:
+        return consumption
+
+    solar = _aggregate_regional_series_mw(df_30min, area_list, "gen_sol_act")
+    wind = _aggregate_regional_series_mw(df_30min, area_list, "gen_win_act")
+
+    if demand_basis == DEMAND_BASIS_RESIDUAL_LOAD:
+        return consumption - solar - wind
+
+    if demand_basis == DEMAND_BASIS_THERMAL_RESIDUAL:
+        flows = _aggregate_regional_series_mw(df_30min, area_list, "inter_flows")
+        hydro = _aggregate_regional_series_mw(df_30min, area_list, "gen_hyd_tot_act")
+        nuclear = _aggregate_regional_series_mw(df_30min, area_list, "gen_nuc_act")
+        return consumption - solar - wind - flows - hydro - nuclear
+
+    raise ValueError(
+        f"Unsupported demand_basis {demand_basis!r}. Expected one of {DEMAND_BASIS_CHOICES}."
+    )
+
+
 def load_regional_demand_mw(df_30min: pd.DataFrame, region: str) -> pd.Series:
     """Return regional consumption in MW from the 30-minute wide table."""
-    if (region, "cons_act") not in df_30min.columns:
-        raise ValueError(f"30-minute data has no cons_act column for region {region!r}.")
-    return pd.to_numeric(df_30min[(region, "cons_act")], errors="coerce")
+    return compute_demand_mw(df_30min, region, demand_basis=DEMAND_BASIS_CONSUMPTION)
 
 
 def find_marginal_unit_by_demand(merit_order: pd.DataFrame, demand_gw: float) -> pd.Series | None:
@@ -967,14 +1080,31 @@ def find_marginal_unit_by_price(merit_order: pd.DataFrame, price_eur_mwh: float)
 
 def identify_price_setters(
     merit_order: pd.DataFrame,
-    region: str,
+    region: str | None = None,
     spot: pd.DataFrame | None = None,
     df_30min: pd.DataFrame | None = None,
     fuel_cocktail: pd.DataFrame | None = None,
     start: str | pd.Timestamp | None = None,
     end: str | pd.Timestamp | None = None,
+    config: PriceSetterConfig | None = None,
+    areas: str | list[str] | None = None,
+    spot_area: str | None = None,
+    demand_basis: str = DEMAND_BASIS_CONSUMPTION,
 ) -> pd.DataFrame:
-    """Identify marginal fuel for each 30-minute interval in one region."""
+    """Identify marginal fuel for each 30-minute interval."""
+    if config is not None:
+        area_list = list(config.areas)
+        spot_reference = config.spot_area
+        demand_mode = config.demand_basis
+        config_name = config.name
+    else:
+        if region is None and areas is None:
+            raise ValueError("Provide either config, region, or areas.")
+        area_list = [region] if areas is None else ([areas] if isinstance(areas, str) else list(areas))
+        spot_reference = spot_area or area_list[0]
+        demand_mode = demand_basis
+        config_name = "+".join(area_list) + f" | {demand_mode}"
+
     if spot is None:
         spot = data_loader.load_jepx_spot()
     if df_30min is None:
@@ -982,35 +1112,33 @@ def identify_price_setters(
     if fuel_cocktail is None:
         fuel_cocktail = data_loader.load_japan_fuel_cocktail()
 
-    demand_mw = load_regional_demand_mw(df_30min, region)
-    spot_eur_mwh = convert_spot_to_eur_mwh(spot, fuel_cocktail, region)
-
-    demand_mw.index = pd.to_datetime(demand_mw.index)
-    spot_eur_mwh.index = pd.to_datetime(spot_eur_mwh.index)
+    demand_mw = compute_demand_mw(df_30min, area_list, demand_basis=demand_mode)
+    spot_eur_mwh = convert_spot_to_eur_mwh(spot, fuel_cocktail, spot_reference)
     spot_index = pd.to_datetime(spot.index)
-    if demand_mw.index.tz is None and spot_index.tz is not None:
-        demand_mw.index = demand_mw.index.tz_localize(spot_index.tz)
-    if spot_eur_mwh.index.tz is None and spot_index.tz is not None:
-        spot_eur_mwh.index = spot_eur_mwh.index.tz_localize(spot_index.tz)
+
+    demand_mw = _align_series_index(demand_mw, spot_index)
+    spot_eur_mwh = _align_series_index(spot_eur_mwh, spot_index)
 
     common_index = demand_mw.index.intersection(spot_eur_mwh.index).intersection(spot_index)
     frame = pd.DataFrame(
         {
-            "region": region,
+            "config": config_name,
+            "areas": ", ".join(area_list),
+            "spot_area": spot_reference,
+            "demand_basis": demand_mode,
             "demand_gw": demand_mw.reindex(common_index) / 1000.0,
-            "spot_jpy_kwh": spot[REGION_SPOT_COLUMNS[region]].astype(float).reindex(common_index),
+            "spot_jpy_kwh": spot[REGION_SPOT_COLUMNS[spot_reference]].astype(float).reindex(common_index),
             "spot_eur_mwh": spot_eur_mwh.reindex(common_index),
         },
         index=common_index,
     )
     for generation_column, fuel in GENERATION_COLUMNS_BY_FUEL.items():
-        column = (region, generation_column)
-        if column in df_30min.columns:
-            generation = pd.to_numeric(df_30min[column], errors="coerce")
-            generation.index = pd.to_datetime(generation.index)
-            if generation.index.tz is None and spot_index.tz is not None:
-                generation.index = generation.index.tz_localize(spot_index.tz)
-            frame[f"gen_{fuel.lower()}_mw"] = generation.reindex(common_index)
+        try:
+            generation = _aggregate_regional_series_mw(df_30min, area_list, generation_column)
+        except ValueError:
+            continue
+        generation = _align_series_index(generation, spot_index)
+        frame[f"gen_{fuel.lower()}_mw"] = generation.reindex(common_index)
 
     if start is not None:
         start_ts = pd.Timestamp(start)
@@ -1027,8 +1155,11 @@ def identify_price_setters(
     price_setters = []
     demand_units = []
     price_units = []
-    for timestamp, row in frame.iterrows():
-        demand_unit = find_marginal_unit_by_demand(merit_order, row["demand_gw"])
+    for _, row in frame.iterrows():
+        demand_gw = row["demand_gw"]
+        if pd.notna(demand_gw) and demand_gw < 0:
+            demand_gw = 0.0
+        demand_unit = find_marginal_unit_by_demand(merit_order, demand_gw)
         price_unit = find_marginal_unit_by_price(merit_order, row["spot_eur_mwh"])
         demand_setters.append(None if demand_unit is None else demand_unit.get("fuel_class"))
         price_setters.append(None if price_unit is None else price_unit.get("fuel_class"))
@@ -1040,6 +1171,72 @@ def identify_price_setters(
     frame["marginal_plant_by_demand"] = demand_units
     frame["marginal_plant_by_price"] = price_units
     return frame
+
+
+def run_price_setter_configs(
+    result: ThermalStackResult,
+    configs: list[PriceSetterConfig] | None = None,
+    spot: pd.DataFrame | None = None,
+    df_30min: pd.DataFrame | None = None,
+    fuel_cocktail: pd.DataFrame | None = None,
+    start: str | pd.Timestamp | None = None,
+    end: str | pd.Timestamp | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Run multiple price-setter configurations in parallel for comparison."""
+    configs = configs or default_price_setter_configs()
+    spot = spot or data_loader.load_jepx_spot()
+    df_30min = df_30min or data_loader.load_df30min()
+    fuel_cocktail = fuel_cocktail or data_loader.load_japan_fuel_cocktail()
+
+    outputs: dict[str, pd.DataFrame] = {}
+    for config in configs:
+        merit_order = merit_order_for_areas(result, areas=list(config.areas))
+        outputs[config.name] = identify_price_setters(
+            merit_order,
+            config=config,
+            spot=spot,
+            df_30min=df_30min,
+            fuel_cocktail=fuel_cocktail,
+            start=start,
+            end=end,
+        )
+    return outputs
+
+
+def summarize_price_setter_configs(config_results: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Summarize marginal-fuel shares across multiple configurations."""
+    summaries = []
+    for config_name, setters in config_results.items():
+        summary = summarize_price_setters(setters)
+        if summary.empty:
+            continue
+        summary["config"] = config_name
+        if "demand_basis" in setters.columns:
+            summary["demand_basis"] = setters["demand_basis"].iloc[0]
+        if "areas" in setters.columns:
+            summary["areas"] = setters["areas"].iloc[0]
+        summaries.append(summary)
+    if not summaries:
+        return pd.DataFrame()
+    return pd.concat(summaries, ignore_index=True)
+
+
+def compare_price_setter_demand_levels(config_results: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Compare demand levels used by each configuration."""
+    rows = []
+    for config_name, setters in config_results.items():
+        rows.append(
+            {
+                "config": config_name,
+                "areas": setters["areas"].iloc[0] if "areas" in setters.columns else None,
+                "demand_basis": setters["demand_basis"].iloc[0] if "demand_basis" in setters.columns else None,
+                "demand_gw_min": setters["demand_gw"].min(),
+                "demand_gw_median": setters["demand_gw"].median(),
+                "demand_gw_max": setters["demand_gw"].max(),
+                "spot_eur_mwh_median": setters["spot_eur_mwh"].median(),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def summarize_price_setters(setters: pd.DataFrame) -> pd.DataFrame:
@@ -1062,8 +1259,12 @@ def plot_price_setter_share_plotly(summary: pd.DataFrame, region: str, title: st
     """Plot marginal-fuel shares from summarize_price_setters()."""
     import plotly.express as px
 
+    label = region
+    if "config" in summary.columns and summary["config"].nunique() == 1:
+        label = str(summary["config"].iloc[0])
+
     if title is None:
-        title = f"Marginal fuel share - {region}"
+        title = f"Marginal fuel share - {label}"
     chart = px.bar(
         summary,
         x="method",
@@ -1074,6 +1275,29 @@ def plot_price_setter_share_plotly(summary: pd.DataFrame, region: str, title: st
         labels={"method": "Identification method", "share": "Share of intervals", "fuel_class": "Fuel"},
     )
     chart.update_layout(template="plotly_white", yaxis_tickformat=".0%")
+    return chart
+
+
+def plot_price_setter_config_comparison(
+    summary: pd.DataFrame,
+    title: str = "Marginal fuel share by configuration",
+):
+    """Plot side-by-side comparison across price-setter configurations."""
+    import plotly.express as px
+
+    chart = px.bar(
+        summary,
+        x="config",
+        y="share",
+        color="fuel_class",
+        facet_col="method",
+        color_discrete_map=MERIT_ORDER_COLORS,
+        title=title,
+        labels={"config": "Configuration", "share": "Share of intervals", "fuel_class": "Fuel"},
+        category_orders={"config": list(summary["config"].drop_duplicates())},
+    )
+    chart.update_layout(template="plotly_white", yaxis_tickformat=".0%")
+    chart.for_each_annotation(lambda annotation: annotation.update(text=annotation.text.split("=")[-1]))
     return chart
 
 
