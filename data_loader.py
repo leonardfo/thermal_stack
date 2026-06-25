@@ -80,55 +80,48 @@ def _resolve_jpyusd(frame: pd.DataFrame) -> pd.Series:
     raise ValueError("fuel cocktail must contain jpyusd, JPYUSD, or EURJPY/EURUSD.")
 
 
+def usd_mmbtu_to_jpy_kwh(usd_mmbtu: pd.Series, jpyusd: pd.Series) -> pd.Series:
+    """Convert USD/MMBtu to JPY/kWh of fuel energy."""
+    return pd.to_numeric(usd_mmbtu, errors="coerce") * jpyusd / MMBTU_TO_MWH / 1000.0
+
+
 def enrich_fuel_cocktail_jpy_kwh(cocktail: pd.DataFrame) -> pd.DataFrame:
     """Add or refresh Japan fuel prices in JPY/kWh."""
     frame = cocktail.copy()
     jpyusd = _resolve_jpyusd(frame)
 
-    if "jcc_jpykwh" not in frame.columns and "jcc_usd_mmbtu" in frame.columns:
-        frame["jcc_jpykwh"] = (
-            pd.to_numeric(frame["jcc_usd_mmbtu"], errors="coerce")
-            * jpyusd
-            * MMBTU_TO_MWH
-            / 1000.0
-        )
+    if "jcc_usd_mmbtu" in frame.columns:
+        frame["jcc_jpykwh"] = usd_mmbtu_to_jpy_kwh(frame["jcc_usd_mmbtu"], jpyusd)
 
-    if "jlc_jpykwh" not in frame.columns and "jlc_usd_mmbtu" in frame.columns:
-        frame["jlc_jpykwh"] = (
-            pd.to_numeric(frame["jlc_usd_mmbtu"], errors="coerce")
-            * jpyusd
-            * MMBTU_TO_MWH
-            / 1000.0
-        )
+    if "jlc_usd_mmbtu" in frame.columns:
+        frame["jlc_jpykwh"] = usd_mmbtu_to_jpy_kwh(frame["jlc_usd_mmbtu"], jpyusd)
 
     lng_usd_mmbtu = None
-    if "jkm_jpykwh" not in frame.columns:
-        if "jkm_usd_mmbtu" in frame.columns:
-            lng_usd_mmbtu = pd.to_numeric(frame["jkm_usd_mmbtu"], errors="coerce")
-        elif "JKM" in frame.columns:
-            lng_usd_mmbtu = pd.to_numeric(frame["JKM"], errors="coerce")
-        if lng_usd_mmbtu is not None:
-            frame["jkm_jpykwh"] = lng_usd_mmbtu * jpyusd * MMBTU_TO_MWH / 1000.0
+    if "jkm_usd_mmbtu" in frame.columns:
+        lng_usd_mmbtu = pd.to_numeric(frame["jkm_usd_mmbtu"], errors="coerce")
+    elif "JKM" in frame.columns:
+        lng_usd_mmbtu = pd.to_numeric(frame["JKM"], errors="coerce")
+    if lng_usd_mmbtu is not None:
+        frame["jkm_jpykwh"] = usd_mmbtu_to_jpy_kwh(lng_usd_mmbtu, jpyusd)
 
-    if "ttf_jpykwh" not in frame.columns:
-        ttf_usd_mmbtu = None
-        if "ttf_usd_mmbtu" in frame.columns:
-            ttf_usd_mmbtu = pd.to_numeric(frame["ttf_usd_mmbtu"], errors="coerce")
-        elif "TTF" in frame.columns:
-            ttf_usd_mmbtu = pd.to_numeric(frame["TTF"], errors="coerce")
-        if ttf_usd_mmbtu is not None:
-            frame["ttf_jpykwh"] = ttf_usd_mmbtu * jpyusd * MMBTU_TO_MWH / 1000.0
+    ttf_usd_mmbtu = None
+    if "ttf_usd_mmbtu" in frame.columns:
+        ttf_usd_mmbtu = pd.to_numeric(frame["ttf_usd_mmbtu"], errors="coerce")
+    elif "TTF" in frame.columns:
+        ttf_usd_mmbtu = pd.to_numeric(frame["TTF"], errors="coerce")
+    if ttf_usd_mmbtu is not None:
+        frame["ttf_jpykwh"] = usd_mmbtu_to_jpy_kwh(ttf_usd_mmbtu, jpyusd)
 
-    if "coal_cif_jpykwh" not in frame.columns:
-        coal_usd_t = None
-        for column in ("coal_jpn_cif_usd_t", "coal_cif_usd_t", "newc"):
-            if column in frame.columns:
-                coal_usd_t = pd.to_numeric(frame[column], errors="coerce")
-                break
-        if coal_usd_t is not None:
-            frame["coal_cif_jpykwh"] = (
-                (coal_usd_t / NEWC_MMBTU_PER_TONNE) * jpyusd * MMBTU_TO_MWH / 1000.0
-            )
+    coal_usd_t = None
+    for column in ("coal_jpn_cif_usd_t", "coal_cif_usd_t", "newc"):
+        if column in frame.columns:
+            coal_usd_t = pd.to_numeric(frame[column], errors="coerce")
+            break
+    if coal_usd_t is not None:
+        frame["coal_cif_jpykwh"] = usd_mmbtu_to_jpy_kwh(
+            coal_usd_t / NEWC_MMBTU_PER_TONNE,
+            jpyusd,
+        )
 
     return frame
 

@@ -1604,6 +1604,7 @@ def summarize_parallel_stack_analysis(analysis_results: dict[str, pd.DataFrame])
         if summary.empty:
             continue
         summary["analysis"] = analysis_name
+        summary["config"] = analysis_name
         for column in ("cost_mode", "cost_methodology", "lng_price_source", "demand_basis", "areas"):
             if column in setters.columns:
                 summary[column] = setters[column].iloc[0]
@@ -1689,6 +1690,14 @@ def plot_price_setter_share_plotly(summary: pd.DataFrame, region: str, title: st
     return chart
 
 
+def _resolve_summary_label_column(summary: pd.DataFrame) -> str:
+    """Return the scenario label column used by parallel summaries."""
+    for column in ("analysis", "config"):
+        if column in summary.columns:
+            return column
+    raise ValueError("summary must contain an 'analysis' or 'config' column.")
+
+
 def plot_price_setter_config_comparison(
     summary: pd.DataFrame,
     title: str = "Marginal fuel share by configuration",
@@ -1696,16 +1705,20 @@ def plot_price_setter_config_comparison(
     """Plot side-by-side comparison across price-setter configurations."""
     import plotly.express as px
 
+    if summary.empty:
+        raise ValueError("summary is empty; widen the filter or rerun parallel analysis.")
+
+    x_column = _resolve_summary_label_column(summary)
     chart = px.bar(
         summary,
-        x="config",
+        x=x_column,
         y="share",
         color="fuel_class",
         facet_col="method",
         color_discrete_map=MERIT_ORDER_COLORS,
         title=title,
-        labels={"config": "Configuration", "share": "Share of intervals", "fuel_class": "Fuel"},
-        category_orders={"config": list(summary["config"].drop_duplicates())},
+        labels={x_column: "Configuration", "share": "Share of intervals", "fuel_class": "Fuel"},
+        category_orders={x_column: list(summary[x_column].drop_duplicates())},
     )
     chart.update_layout(template="plotly_white", yaxis_tickformat=".0%")
     chart.for_each_annotation(lambda annotation: annotation.update(text=annotation.text.split("=")[-1]))
