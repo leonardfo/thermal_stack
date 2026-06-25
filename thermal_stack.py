@@ -53,6 +53,9 @@ MERIT_ORDER_COLORS = {
     "Coal": "#333333",
     "LNG": "#ff8c00",
     "Oil": "#8b4513",
+    "Hydro": "#1f78b4",
+    "Solar": "#f2c94c",
+    "Wind": "#56b4e9",
 }
 
 REGION_SPOT_COLUMNS = {
@@ -71,6 +74,8 @@ GENERATION_COLUMNS_BY_FUEL = {
     "Coal": "gen_coa_act",
     "LNG": "gen_gas_act",
     "Oil": "gen_oil_act",
+    "Nuclear": "gen_nuc_act",
+    "Hydro": "gen_hyd_act",
 }
 
 DEMAND_BASIS_CONSUMPTION = "consumption"
@@ -84,13 +89,49 @@ DEMAND_BASIS_CHOICES = (
 
 KANSAI_FENCE_AREAS = ("Hokuriku", "Kansai", "Chubu")
 
+COST_METHOD_LEGACY_EUR = "legacy_eur_vom"
+COST_METHOD_OPERATIONAL_JPY = "operational_jpy"
+COST_METHOD_ARTICLE_JPY = "article_jpy"
+
+LNG_PRICE_JLC = "jlc"
+LNG_PRICE_JKM = "jkm"
+LNG_PRICE_TTF = "ttf"
+
+ARTICLE_ALPHA_BY_FUEL = {
+    "LNG": 0.023,
+    "Coal": 0.055,
+    "Oil": 0.048,
+}
+ARTICLE_CV_BY_FUEL = {
+    "Oil": 41.63,
+    "LNG": 54.7,
+    "Coal": 26.08,
+}
+ARTICLE_CF_JPY_BY_FUEL = {
+    "Oil": 7600.0,
+    "LNG": 2800.0,
+    "Coal": 2000.0,
+}
+LNG_FUEL_JPY_COLUMNS = {
+    LNG_PRICE_JLC: "jlc_jpykwh",
+    LNG_PRICE_JKM: "jkm_jpykwh",
+    LNG_PRICE_TTF: "ttf_jpykwh",
+}
+ZERO_MC_GENERATION_COLUMNS = {
+    "Hydro": ("gen_hyd_tot_act", "gen_hyd_act"),
+    "Solar": ("gen_sol_act",),
+    "Wind": ("gen_win_act",),
+}
+MC_COLUMN_JPY = "mc_jpy_kwh"
+MC_COLUMN_EUR = "mc_eur_mwh"
+
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ThermalStackConfig:
     """Configuration for the thermal stack pipeline."""
-    production_start: str | pd.Timestamp = "2024-03-01"
-    outage_start: str | pd.Timestamp = "2024-03-15"
+    production_start: str | pd.Timestamp = "2026-04-01"
+    outage_start: str | pd.Timestamp = "2026-03-15"
     forecast_start: str | pd.Timestamp | None = None
     delivery_month: str | pd.Timestamp | None = None
     export_excel: bool = True
@@ -102,6 +143,65 @@ class ThermalStackConfig:
     production_types: tuple[str, ...] = DEFAULT_PRODUCTION_TYPES
     stack_fuels: tuple[str, ...] = DEFAULT_STACK_FUELS
     use_adjusted_capacity: bool = True
+    marginal_cost_config: "MarginalCostConfig | None" = None
+
+
+@dataclass(frozen=True)
+class MarginalCostConfig:
+    """Marginal-cost methodology and fuel-price assumptions."""
+    name: str
+    methodology: str = COST_METHOD_OPERATIONAL_JPY
+    lng_price_source: str = LNG_PRICE_JLC
+    zero_mc_fuels: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.methodology not in {
+            COST_METHOD_LEGACY_EUR,
+            COST_METHOD_OPERATIONAL_JPY,
+            COST_METHOD_ARTICLE_JPY,
+        }:
+            raise ValueError(f"Unsupported methodology {self.methodology!r}.")
+        if self.lng_price_source not in LNG_FUEL_JPY_COLUMNS:
+            raise ValueError(f"Unsupported lng_price_source {self.lng_price_source!r}.")
+
+
+@dataclass(frozen=True)
+class StackAnalysisConfig:
+    """Combined marginal-cost and price-setter scenario."""
+    name: str
+    cost: MarginalCostConfig
+    price_setter: "PriceSetterConfig"
+
+
+def default_marginal_cost_configs() -> list[MarginalCostConfig]:
+    """Return default parallel marginal-cost configurations."""
+    return [
+        MarginalCostConfig("operational_jlc_jpy", COST_METHOD_OPERATIONAL_JPY, LNG_PRICE_JLC),
+        MarginalCostConfig("article_jpy", COST_METHOD_ARTICLE_JPY, LNG_PRICE_JLC, ("Hydro",)),
+        MarginalCostConfig(
+            "article_jpy_vre",
+            COST_METHOD_ARTICLE_JPY,
+            LNG_PRICE_JLC,
+            ("Hydro", "Solar", "Wind"),
+        ),
+        MarginalCostConfig("hedge_jkm_jpy", COST_METHOD_OPERATIONAL_JPY, LNG_PRICE_JKM),
+        MarginalCostConfig("legacy_eur_vom", COST_METHOD_LEGACY_EUR, LNG_PRICE_JLC),
+    ]
+
+
+def default_parallel_stack_configs(
+    include_kansai_fence: bool = True,
+    cost_configs: list[MarginalCostConfig] | None = None,
+    price_setter_configs: list["PriceSetterConfig"] | None = None,
+) -> list[StackAnalysisConfig]:
+    """Cartesian product of cost and price-setter configurations."""
+    costs = cost_configs or default_marginal_cost_configs()
+    setters = price_setter_configs or default_price_setter_configs(include_kansai_fence=include_kansai_fence)
+    return [
+        StackAnalysisConfig(name=f"{cost.name} :: {setter.name}", cost=cost, price_setter=setter)
+        for cost in costs
+        for setter in setters
+    ]
 
 
 @dataclass(frozen=True)
@@ -121,6 +221,7 @@ class ThermalStackResult:
     delivery_month: pd.Timestamp
     capacity_summary: dict
     export_path: Path | None
+    marginal_cost_config: MarginalCostConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +248,9 @@ class PriceSetterConfig:
 def default_price_setter_configs(
     include_kansai_fence: bool = True,
     include_tokyo: bool = False,
+    include_chubu: bool = False,
+    include_hokuriku: bool = False,
+    include_kansai: bool = False,
 ) -> list[PriceSetterConfig]:
     """Return default parallel price-setter configurations."""
     region_groups: list[tuple[str, tuple[str, ...], str]] = [
@@ -550,34 +654,63 @@ def convert_efficiency_to_energy_basis(
         return efficiency * hhv_per_lhv
     raise ValueError(f"Unsupported energy-basis conversion: {source_basis!r} -> {target_basis!r}")
 
-def compute_mc_eur(
+def _article_expense_jpy_kwh(gen_type: str, efficiency: float, alpha: float) -> float:
+    """Convert article C_f to JPY/kWh using CV, efficiency and auxiliary factor."""
+    if gen_type not in ARTICLE_CF_JPY_BY_FUEL:
+        return 0.0
+    cv = ARTICLE_CV_BY_FUEL[gen_type]
+    c_f = ARTICLE_CF_JPY_BY_FUEL[gen_type]
+    if gen_type == "Oil":
+        mj_per_physical_unit = cv * 1000.0
+    else:
+        mj_per_physical_unit = cv * 1000.0
+    if mj_per_physical_unit <= 0 or efficiency <= 0:
+        return np.nan
+    net_efficiency = efficiency * (1.0 - alpha)
+    if net_efficiency <= 0:
+        return np.nan
+    return c_f / mj_per_physical_unit / 3.6 / net_efficiency
+
+
+def _get_fuel_jpy_kwh(gen_type: str, fuel_row: pd.Series | dict, lng_price_source: str) -> float:
+    """Return fuel energy price in JPY/kWh for one fuel."""
+    if gen_type == "LNG":
+        column = LNG_FUEL_JPY_COLUMNS[lng_price_source]
+        return float(fuel_row.get(column, np.nan))
+    if gen_type == "Coal":
+        return float(fuel_row.get("coal_cif_jpykwh", np.nan))
+    if gen_type == "Oil":
+        return float(fuel_row.get("jcc_jpykwh", np.nan))
+    return np.nan
+
+
+def compute_mc_jpy_kwh(
     gen_type: str,
     efficiency_pct: float,
     fuel_row: pd.Series | dict,
+    cost_config: MarginalCostConfig | None = None,
     efficiency_basis: object = DEFAULT_EFFICIENCY_BASIS,
     fuel_basis: object = DEFAULT_FUEL_PRICE_BASIS,
 ) -> float:
-    """Compute marginal cost in EUR/MWh for one fuel and efficiency."""
+    """Compute marginal cost in JPY/kWh for one fuel and efficiency."""
+    cost_config = cost_config or MarginalCostConfig("default_operational", COST_METHOD_OPERATIONAL_JPY)
     if pd.isna(efficiency_pct) or efficiency_pct <= 0:
         return np.nan
 
-    eurusd = fuel_row.get("EURUSD", fuel_row.get("eurusd", np.nan))
-    if pd.isna(eurusd) or eurusd <= 0:
-        return np.nan
+    if gen_type in cost_config.zero_mc_fuels:
+        return 0.0
 
     if gen_type == "Nuclear":
-        return VOM_USD_PER_MWH["Nuclear"] / eurusd
+        if cost_config.methodology == COST_METHOD_ARTICLE_JPY:
+            return 0.0
+        eurusd = fuel_row.get("EURUSD", fuel_row.get("eurusd", np.nan))
+        eurjpy = fuel_row.get("EURJPY", fuel_row.get("eurjpy", np.nan))
+        if pd.isna(eurusd) or pd.isna(eurjpy) or eurusd <= 0 or eurjpy <= 0:
+            return np.nan
+        return (VOM_USD_PER_MWH["Nuclear"] / eurusd) * eurjpy / 1000.0
 
-    if gen_type == "LNG":
-        fuel = fuel_row.get("jlc_eurmwh", np.nan)
-    elif gen_type == "Coal":
-        fuel = fuel_row.get("coal_cif_eurmwh", fuel_row.get("newc_eurmwh", np.nan))
-    elif gen_type == "Oil":
-        fuel = fuel_row.get("jcc_eurmwh", np.nan)
-    else:
-        return np.nan
-
-    if pd.isna(fuel):
+    fuel_jpy_kwh = _get_fuel_jpy_kwh(gen_type, fuel_row, cost_config.lng_price_source)
+    if pd.isna(fuel_jpy_kwh):
         return np.nan
 
     aligned_efficiency_pct = convert_efficiency_to_energy_basis(
@@ -590,12 +723,96 @@ def compute_mc_eur(
         return np.nan
 
     efficiency = aligned_efficiency_pct / 100.0
-    variable_om = VOM_USD_PER_MWH.get(gen_type, 0.0) / eurusd
-    return fuel / efficiency + variable_om
+    if cost_config.methodology == COST_METHOD_ARTICLE_JPY:
+        alpha = ARTICLE_ALPHA_BY_FUEL.get(gen_type, 0.0)
+        net_efficiency = efficiency * (1.0 - alpha)
+        if net_efficiency <= 0:
+            return np.nan
+        expense = _article_expense_jpy_kwh(gen_type, efficiency, alpha)
+        return fuel_jpy_kwh / net_efficiency + expense
+
+    if cost_config.methodology == COST_METHOD_OPERATIONAL_JPY:
+        return fuel_jpy_kwh / efficiency
+
+    return np.nan
 
 
-def build_marginal_costs(df_active_units: pd.DataFrame, df_cocktail: pd.DataFrame) -> pd.DataFrame:
+def compute_mc_eur(
+    gen_type: str,
+    efficiency_pct: float,
+    fuel_row: pd.Series | dict,
+    cost_config: MarginalCostConfig | None = None,
+    efficiency_basis: object = DEFAULT_EFFICIENCY_BASIS,
+    fuel_basis: object = DEFAULT_FUEL_PRICE_BASIS,
+) -> float:
+    """Compute marginal cost in EUR/MWh for one fuel and efficiency."""
+    cost_config = cost_config or MarginalCostConfig("default_operational", COST_METHOD_OPERATIONAL_JPY)
+    if cost_config.methodology == COST_METHOD_LEGACY_EUR:
+        if pd.isna(efficiency_pct) or efficiency_pct <= 0:
+            return np.nan
+
+        eurusd = fuel_row.get("EURUSD", fuel_row.get("eurusd", np.nan))
+        if pd.isna(eurusd) or eurusd <= 0:
+            return np.nan
+
+        if gen_type == "Nuclear":
+            return VOM_USD_PER_MWH["Nuclear"] / eurusd
+
+        if gen_type == "LNG":
+            fuel = fuel_row.get("jlc_eurmwh", np.nan)
+        elif gen_type == "Coal":
+            fuel = fuel_row.get("coal_cif_eurmwh", fuel_row.get("newc_eurmwh", np.nan))
+        elif gen_type == "Oil":
+            fuel = fuel_row.get("jcc_eurmwh", np.nan)
+        else:
+            return np.nan
+
+        if pd.isna(fuel):
+            return np.nan
+
+        aligned_efficiency_pct = convert_efficiency_to_energy_basis(
+            gen_type,
+            efficiency_pct,
+            from_basis=efficiency_basis,
+            to_basis=fuel_basis,
+        )
+        if pd.isna(aligned_efficiency_pct) or aligned_efficiency_pct <= 0:
+            return np.nan
+
+        efficiency = aligned_efficiency_pct / 100.0
+        variable_om = VOM_USD_PER_MWH.get(gen_type, 0.0) / eurusd
+        return fuel / efficiency + variable_om
+
+    mc_jpy_kwh = compute_mc_jpy_kwh(
+        gen_type,
+        efficiency_pct,
+        fuel_row,
+        cost_config=cost_config,
+        efficiency_basis=efficiency_basis,
+        fuel_basis=fuel_basis,
+    )
+    eurjpy = fuel_row.get("EURJPY", fuel_row.get("eurjpy", np.nan))
+    if pd.isna(mc_jpy_kwh) or pd.isna(eurjpy) or eurjpy <= 0:
+        return np.nan
+    return float(mc_jpy_kwh) * 1000.0 / float(eurjpy)
+
+
+def resolve_mc_column(merit_order: pd.DataFrame, prefer_jpy: bool = True) -> str:
+    """Return the marginal-cost column available on a merit-order frame."""
+    if prefer_jpy and MC_COLUMN_JPY in merit_order.columns:
+        return MC_COLUMN_JPY
+    if MC_COLUMN_EUR in merit_order.columns:
+        return MC_COLUMN_EUR
+    raise ValueError("Merit order is missing mc_jpy_kwh and mc_eur_mwh columns.")
+
+
+def build_marginal_costs(
+    df_active_units: pd.DataFrame,
+    df_cocktail: pd.DataFrame,
+    cost_config: MarginalCostConfig | None = None,
+) -> pd.DataFrame:
     """Build monthly marginal costs for every active stack unit."""
+    cost_config = cost_config or MarginalCostConfig("operational_jlc_jpy", COST_METHOD_OPERATIONAL_JPY)
     _require_columns(
         df_active_units,
         ["plant_name_jp", "unit_digit", "fuel_class", "plant_efficiency"],
@@ -611,18 +828,29 @@ def build_marginal_costs(df_active_units: pd.DataFrame, df_cocktail: pd.DataFram
     for _, fuel_row in monthly_fuels.iterrows():
         delivery = pd.Timestamp(fuel_row["delivery"])
         for _, plant in df_active_units.iterrows():
+            efficiency_basis = plant.get("plant_efficiency_basis", plant.get("efficiency_basis", DEFAULT_EFFICIENCY_BASIS))
+            fuel_basis = plant.get("fuel_price_basis", DEFAULT_FUEL_PRICE_BASIS)
+            mc_jpy_kwh = compute_mc_jpy_kwh(
+                plant["fuel_class"],
+                plant["plant_efficiency"],
+                fuel_row,
+                cost_config=cost_config,
+                efficiency_basis=efficiency_basis,
+                fuel_basis=fuel_basis,
+            )
             mc_eur_mwh = compute_mc_eur(
                 plant["fuel_class"],
                 plant["plant_efficiency"],
                 fuel_row,
-                efficiency_basis=plant.get("plant_efficiency_basis", plant.get("efficiency_basis", DEFAULT_EFFICIENCY_BASIS)),
-                fuel_basis=plant.get("fuel_price_basis", DEFAULT_FUEL_PRICE_BASIS),
+                cost_config=cost_config,
+                efficiency_basis=efficiency_basis,
+                fuel_basis=fuel_basis,
             )
             aligned_efficiency_pct = convert_efficiency_to_energy_basis(
                 plant["fuel_class"],
                 plant["plant_efficiency"],
-                from_basis=plant.get("plant_efficiency_basis", plant.get("efficiency_basis", DEFAULT_EFFICIENCY_BASIS)),
-                to_basis=plant.get("fuel_price_basis", DEFAULT_FUEL_PRICE_BASIS),
+                from_basis=efficiency_basis,
+                to_basis=fuel_basis,
             )
             records.append(
                 {
@@ -630,11 +858,14 @@ def build_marginal_costs(df_active_units: pd.DataFrame, df_cocktail: pd.DataFram
                     "plant_name_jp": plant["plant_name_jp"],
                     "unit_digit": plant["unit_digit"],
                     "fuel_class": plant["fuel_class"],
-                    "mc_eur_mwh": mc_eur_mwh,
+                    MC_COLUMN_JPY: mc_jpy_kwh,
+                    MC_COLUMN_EUR: mc_eur_mwh,
                     "efficiency_pct": plant["plant_efficiency"],
                     "efficiency_pct_mc_basis": aligned_efficiency_pct,
-                    "efficiency_basis": plant.get("plant_efficiency_basis", plant.get("efficiency_basis", DEFAULT_EFFICIENCY_BASIS)),
-                    "fuel_price_basis": plant.get("fuel_price_basis", DEFAULT_FUEL_PRICE_BASIS),
+                    "efficiency_basis": efficiency_basis,
+                    "fuel_price_basis": fuel_basis,
+                    "cost_methodology": cost_config.methodology,
+                    "lng_price_source": cost_config.lng_price_source,
                 }
             )
 
@@ -647,14 +878,20 @@ def build_merit_order(
     region: str | None = None,
     areas: str | list[str] | None = None,
     capacity_column: str = "capacity_mw",
+    mc_column: str | None = None,
 ) -> pd.DataFrame:
     """Build sorted merit order for one delivery month."""
+    mc_column = mc_column or (MC_COLUMN_JPY if MC_COLUMN_JPY in df_mc.columns else MC_COLUMN_EUR)
     _require_columns(df_units, ["plant_name_jp", "unit_digit", "fuel_class", capacity_column], "df_units")
-    _require_columns(df_mc, ["delivery", "plant_name_jp", "unit_digit", "fuel_class", "mc_eur_mwh"], "df_mc")
+    _require_columns(df_mc, ["delivery", "plant_name_jp", "unit_digit", "fuel_class", mc_column], "df_mc")
 
     delivery = _month_start(delivery_month)
     mc_month = df_mc[df_mc["delivery"] == delivery].copy()
-    mc_columns = ["plant_name_jp", "unit_digit", "fuel_class", "mc_eur_mwh", "efficiency_pct"]
+    mc_columns = ["plant_name_jp", "unit_digit", "fuel_class", mc_column, "efficiency_pct"]
+    if MC_COLUMN_JPY in mc_month.columns and mc_column != MC_COLUMN_JPY:
+        mc_columns.append(MC_COLUMN_JPY)
+    if MC_COLUMN_EUR in mc_month.columns and mc_column != MC_COLUMN_EUR:
+        mc_columns.append(MC_COLUMN_EUR)
     mc_columns = [column for column in mc_columns if column in mc_month.columns]
 
     merged = df_units.merge(
@@ -672,20 +909,79 @@ def build_merit_order(
         merged = merged[merged["EastWest"] == region]
 
     merged["capacity_mw"] = pd.to_numeric(merged[capacity_column], errors="coerce")
-    merged = merged.dropna(subset=["mc_eur_mwh"]).copy()
+    merged = merged.dropna(subset=[mc_column]).copy()
     merged = merged.dropna(subset=["capacity_mw"]).copy()
     merged = merged[merged["capacity_mw"] > 0].copy()
-    merged = merged.sort_values("mc_eur_mwh").reset_index(drop=True)
+    merged = merged.sort_values(mc_column).reset_index(drop=True)
     merged["cum_GW"] = merged["capacity_mw"].cumsum() / 1000
     return merged
+
+
+def _resolve_generation_column(df_30min: pd.DataFrame, area: str, candidates: tuple[str, ...]) -> str | None:
+    for column in candidates:
+        if (area, column) in df_30min.columns:
+            return column
+    return None
+
+
+def append_zero_mc_supply(
+    merit_order: pd.DataFrame,
+    df_30min: pd.DataFrame,
+    areas: Iterable[str],
+    zero_mc_fuels: Iterable[str],
+    delivery_month: str | pd.Timestamp,
+    mc_column: str = MC_COLUMN_JPY,
+) -> pd.DataFrame:
+    """Append average zero-marginal-cost VRE/hydro blocks to a merit order."""
+    if not zero_mc_fuels:
+        return merit_order
+
+    month_start = _month_start(delivery_month)
+    month_end = month_start + pd.offsets.MonthEnd(0)
+    month_data = df_30min.loc[month_start:month_end]
+    if month_data.empty:
+        return merit_order
+
+    extra_rows = []
+    for fuel in zero_mc_fuels:
+        candidates = ZERO_MC_GENERATION_COLUMNS.get(fuel, ())
+        capacity_mw = 0.0
+        for area in areas:
+            column = _resolve_generation_column(df_30min, area, candidates)
+            if column is None:
+                continue
+            capacity_mw += float(pd.to_numeric(month_data[(area, column)], errors="coerce").mean())
+        if capacity_mw <= 0:
+            continue
+        row = {
+            "plant_name_jp": f"{fuel}_aggregate",
+            "unit_digit": 0,
+            "fuel_class": fuel,
+            "capacity_mw": capacity_mw,
+            mc_column: 0.0,
+        }
+        if MC_COLUMN_EUR in merit_order.columns:
+            row[MC_COLUMN_EUR] = 0.0
+        extra_rows.append(row)
+
+    if not extra_rows:
+        return merit_order
+
+    combined = pd.concat([merit_order, pd.DataFrame(extra_rows)], ignore_index=True)
+    combined = combined.sort_values(resolve_mc_column(combined)).reset_index(drop=True)
+    combined["cum_GW"] = combined["capacity_mw"].cumsum() / 1000
+    return combined
 
 
 def merit_order_for_areas(
     result: ThermalStackResult,
     areas: str | list[str] | None = None,
     use_adjusted_capacity: bool | None = None,
+    cost_config: MarginalCostConfig | None = None,
+    df_30min: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build merit order for one or more market areas."""
+    cost_config = cost_config or result.marginal_cost_config
     use_adjusted = (
         result.merit_order.attrs.get("use_adjusted_capacity", True)
         if use_adjusted_capacity is None
@@ -695,12 +991,27 @@ def merit_order_for_areas(
     if use_adjusted:
         units["capacity_mw"] = pd.to_numeric(units["Capacity_adj_GW"], errors="coerce") * 1000
 
-    return build_merit_order(
+    marginal_costs = result.marginal_costs
+    if cost_config is not None and result.marginal_cost_config != cost_config:
+        marginal_costs = build_marginal_costs(result.active_units, result.fuel_cocktail, cost_config=cost_config)
+
+    merit_order = build_merit_order(
         result.delivery_month,
-        result.marginal_costs,
+        marginal_costs,
         units,
         areas=areas,
     )
+    if cost_config is not None and cost_config.zero_mc_fuels:
+        df_30min = df_30min or data_loader.load_df30min()
+        area_list = [areas] if isinstance(areas, str) else list(areas or [])
+        merit_order = append_zero_mc_supply(
+            merit_order,
+            df_30min,
+            area_list,
+            cost_config.zero_mc_fuels,
+            result.delivery_month,
+        )
+    return merit_order
 
 
 def _select_merit_order_month(
@@ -746,7 +1057,12 @@ def build_thermal_stack(config: ThermalStackConfig | None = None) -> ThermalStac
     active_units = active_units[active_units["fuel_class"].isin(config.stack_fuels)].reset_index(drop=True)
 
     fuel_cocktail = data_loader.load_japan_fuel_cocktail()
-    marginal_costs = build_marginal_costs(active_units, fuel_cocktail)
+    cost_config = config.marginal_cost_config or MarginalCostConfig(
+        "operational_jlc_jpy",
+        COST_METHOD_OPERATIONAL_JPY,
+        LNG_PRICE_JLC,
+    )
+    marginal_costs = build_marginal_costs(active_units, fuel_cocktail, cost_config=cost_config)
 
     requested_month = _month_start(config.delivery_month)
     adjusted_units, capacity_summary = build_adjusted_capacity_month(stack_units, outages_all, requested_month)
@@ -773,6 +1089,7 @@ def build_thermal_stack(config: ThermalStackConfig | None = None) -> ThermalStac
         delivery_month=delivery_month,
         capacity_summary=capacity_summary,
         export_path=export_path,
+        marginal_cost_config=cost_config,
     )
 
 def plot_merit_order_plotly(
@@ -782,6 +1099,7 @@ def plot_merit_order_plotly(
     title: str | None = None,
     height: int = 650,
     demand_gw: float | None = None,
+    spot_price_jpy_kwh: float | None = None,
     spot_price_eur_mwh: float | None = None,
     marginal_unit: pd.Series | None = None,
 ):
@@ -789,13 +1107,15 @@ def plot_merit_order_plotly(
     import plotly.graph_objects as go
 
     mo = merit_order.copy()
-    _require_columns(mo, ["cum_GW", "capacity_mw", "mc_eur_mwh", "fuel_class"], "merit_order")
+    mc_column = resolve_mc_column(mo)
+    price_unit = "JPY/kWh" if mc_column == MC_COLUMN_JPY else "EUR/MWh"
+    _require_columns(mo, ["cum_GW", "capacity_mw", mc_column, "fuel_class"], "merit_order")
 
     if region is not None:
         _require_columns(mo, ["area_en"], "merit_order")
         regions = region if isinstance(region, list) else [region]
         mo = mo[mo["area_en"].isin(regions)].copy()
-        mo = mo.sort_values("mc_eur_mwh").reset_index(drop=True)
+        mo = mo.sort_values(mc_column).reset_index(drop=True)
         mo["cum_GW"] = mo["capacity_mw"].cumsum() / 1000
 
     if period is None:
@@ -808,13 +1128,14 @@ def plot_merit_order_plotly(
         period_label = period.strftime("%B %Y")
         title = f"Merit Order ({region_label}) - {period_label}"
 
+    fuels = ["Nuclear", "Hydro", "Solar", "Wind", "Coal", "LNG", "Oil"]
     fig = go.Figure()
-    for fuel in ["Nuclear", "Coal", "LNG", "Oil"]:
+    for fuel in fuels:
         fuel_rows = mo[mo["fuel_class"] == fuel]
         for _, row in fuel_rows.iterrows():
             x0 = row["cum_GW"] - row["capacity_mw"] / 1000
             x1 = row["cum_GW"]
-            y = row["mc_eur_mwh"]
+            y = row[mc_column]
             fig.add_trace(
                 go.Scatter(
                     x=[x0, x1, x1, x0, x0],
@@ -830,7 +1151,7 @@ def plot_merit_order_plotly(
                 )
             )
 
-    for fuel in ["Nuclear", "Coal", "LNG", "Oil"]:
+    for fuel in fuels:
         if fuel in set(mo["fuel_class"]):
             fig.add_trace(
                 go.Scatter(
@@ -845,12 +1166,13 @@ def plot_merit_order_plotly(
             )
 
     if marginal_unit is None and demand_gw is not None:
-        marginal_unit = find_marginal_unit_by_demand(mo, demand_gw)
-    if marginal_unit is None and spot_price_eur_mwh is not None:
-        marginal_unit = find_marginal_unit_by_price(mo, spot_price_eur_mwh)
+        marginal_unit = find_marginal_unit_by_demand(mo, demand_gw, mc_column=mc_column)
+    spot_price = spot_price_jpy_kwh if mc_column == MC_COLUMN_JPY else spot_price_eur_mwh
+    if marginal_unit is None and spot_price is not None:
+        marginal_unit = find_marginal_unit_by_price(mo, spot_price, mc_column=mc_column)
 
     x_max = mo["cum_GW"].max() * 1.02
-    y_max = mo["mc_eur_mwh"].quantile(0.98) * 1.15
+    y_max = mo[mc_column].quantile(0.98) * 1.15
 
     if demand_gw is not None:
         fig.add_vline(
@@ -862,19 +1184,19 @@ def plot_merit_order_plotly(
         )
         x_max = max(x_max, demand_gw * 1.05)
 
-    if spot_price_eur_mwh is not None:
+    if spot_price is not None:
         fig.add_hline(
-            y=spot_price_eur_mwh,
+            y=spot_price,
             line_dash="dot",
             line_color="#d62728",
-            annotation_text=f"Spot {spot_price_eur_mwh:.0f} EUR/MWh",
+            annotation_text=f"Spot {spot_price:.2f} {price_unit}",
             annotation_position="right",
         )
-        y_max = max(y_max, spot_price_eur_mwh * 1.1)
+        y_max = max(y_max, spot_price * 1.1)
 
     if marginal_unit is not None and not pd.isna(marginal_unit.get("cum_GW", np.nan)):
         marginal_x = marginal_unit["cum_GW"] - marginal_unit["capacity_mw"] / 2000
-        marginal_y = marginal_unit["mc_eur_mwh"]
+        marginal_y = marginal_unit[mc_column]
         fuel = marginal_unit.get("fuel_class", "unknown")
         fig.add_trace(
             go.Scatter(
@@ -892,7 +1214,7 @@ def plot_merit_order_plotly(
     fig.update_layout(
         title=title,
         xaxis_title="Cumulative GW",
-        yaxis_title="Marginal Cost (EUR/MWh)",
+        yaxis_title=f"Marginal Cost ({price_unit})",
         height=height,
         hovermode="closest",
         template="plotly_white",
@@ -909,6 +1231,8 @@ def plot_regional_merit_order_plotly(result: ThermalStackResult, height: int = 6
 
     west = merit_order_for_areas(result, areas=list(WEST_JAPAN_AREAS))
     east = merit_order_for_areas(result, areas=list(EAST_JAPAN_AREAS))
+    mc_column = resolve_mc_column(west)
+    price_unit = "JPY/kWh" if mc_column == MC_COLUMN_JPY else "EUR/MWh"
     fig = make_subplots(
         rows=1,
         cols=2,
@@ -928,7 +1252,7 @@ def plot_regional_merit_order_plotly(result: ThermalStackResult, height: int = 6
             fig.add_trace(
                 go.Scatter(
                     x=[x0, x1, x1, x0, x0],
-                    y=[0, 0, row["mc_eur_mwh"], row["mc_eur_mwh"], 0],
+                    y=[0, 0, row[mc_column], row[mc_column], 0],
                     fill="toself",
                     fillcolor=MERIT_ORDER_COLORS.get(fuel, "gray"),
                     opacity=0.7,
@@ -944,7 +1268,7 @@ def plot_regional_merit_order_plotly(result: ThermalStackResult, height: int = 6
 
     fig.update_xaxes(title_text="Cumulative GW", row=1, col=1)
     fig.update_xaxes(title_text="Cumulative GW", row=1, col=2)
-    fig.update_yaxes(title_text="Marginal Cost (EUR/MWh)", row=1, col=1)
+    fig.update_yaxes(title_text=f"Marginal Cost ({price_unit})", row=1, col=1)
     fig.update_layout(
         title=f"Merit Order - West vs East Japan - {result.delivery_month.strftime('%B %Y')}",
         height=height,
@@ -1040,7 +1364,15 @@ def compute_demand_mw(
 
     if demand_basis == DEMAND_BASIS_THERMAL_RESIDUAL:
         flows = _aggregate_regional_series_mw(df_30min, area_list, "inter_flows")
-        hydro = _aggregate_regional_series_mw(df_30min, area_list, "gen_hyd_tot_act")
+        hydro = None
+        for hydro_column in ("gen_hyd_tot_act", "gen_hyd_act"):
+            try:
+                hydro = _aggregate_regional_series_mw(df_30min, area_list, hydro_column)
+                break
+            except ValueError:
+                continue
+        if hydro is None:
+            hydro = 0.0
         nuclear = _aggregate_regional_series_mw(df_30min, area_list, "gen_nuc_act")
         return consumption - solar - wind - flows - hydro - nuclear
 
@@ -1054,25 +1386,35 @@ def load_regional_demand_mw(df_30min: pd.DataFrame, region: str) -> pd.Series:
     return compute_demand_mw(df_30min, region, demand_basis=DEMAND_BASIS_CONSUMPTION)
 
 
-def find_marginal_unit_by_demand(merit_order: pd.DataFrame, demand_gw: float) -> pd.Series | None:
+def find_marginal_unit_by_demand(
+    merit_order: pd.DataFrame,
+    demand_gw: float,
+    mc_column: str | None = None,
+) -> pd.Series | None:
     """Return the marginal stack unit for a given demand level."""
     if pd.isna(demand_gw):
         return None
 
-    mo = merit_order.sort_values("mc_eur_mwh").reset_index(drop=True)
+    mc_column = mc_column or resolve_mc_column(merit_order)
+    mo = merit_order.sort_values(mc_column).reset_index(drop=True)
     eligible = mo.index[mo["cum_GW"] >= demand_gw]
     if len(eligible) == 0:
         return mo.iloc[-1]
     return mo.loc[eligible[0]]
 
 
-def find_marginal_unit_by_price(merit_order: pd.DataFrame, price_eur_mwh: float) -> pd.Series | None:
+def find_marginal_unit_by_price(
+    merit_order: pd.DataFrame,
+    spot_price: float,
+    mc_column: str | None = None,
+) -> pd.Series | None:
     """Return the marginal stack unit closest to the observed clearing price."""
-    if pd.isna(price_eur_mwh):
+    if pd.isna(spot_price):
         return None
 
-    mo = merit_order.sort_values("mc_eur_mwh").reset_index(drop=True)
-    eligible = mo[mo["mc_eur_mwh"] <= price_eur_mwh]
+    mc_column = mc_column or resolve_mc_column(merit_order)
+    mo = merit_order.sort_values(mc_column).reset_index(drop=True)
+    eligible = mo[mo[mc_column] <= spot_price]
     if eligible.empty:
         return mo.iloc[0]
     return eligible.iloc[-1]
@@ -1113,13 +1455,14 @@ def identify_price_setters(
         fuel_cocktail = data_loader.load_japan_fuel_cocktail()
 
     demand_mw = compute_demand_mw(df_30min, area_list, demand_basis=demand_mode)
-    spot_eur_mwh = convert_spot_to_eur_mwh(spot, fuel_cocktail, spot_reference)
     spot_index = pd.to_datetime(spot.index)
+    spot_jpy_kwh = spot[REGION_SPOT_COLUMNS[spot_reference]].astype(float)
 
     demand_mw = _align_series_index(demand_mw, spot_index)
-    spot_eur_mwh = _align_series_index(spot_eur_mwh, spot_index)
+    spot_jpy_kwh = _align_series_index(spot_jpy_kwh, spot_index)
 
-    common_index = demand_mw.index.intersection(spot_eur_mwh.index).intersection(spot_index)
+    mc_column = resolve_mc_column(merit_order)
+    common_index = demand_mw.index.intersection(spot_jpy_kwh.index).intersection(spot_index)
     frame = pd.DataFrame(
         {
             "config": config_name,
@@ -1127,11 +1470,14 @@ def identify_price_setters(
             "spot_area": spot_reference,
             "demand_basis": demand_mode,
             "demand_gw": demand_mw.reindex(common_index) / 1000.0,
-            "spot_jpy_kwh": spot[REGION_SPOT_COLUMNS[spot_reference]].astype(float).reindex(common_index),
-            "spot_eur_mwh": spot_eur_mwh.reindex(common_index),
+            "spot_jpy_kwh": spot_jpy_kwh.reindex(common_index),
         },
         index=common_index,
     )
+    if MC_COLUMN_EUR in merit_order.columns:
+        spot_eur_mwh = convert_spot_to_eur_mwh(spot, fuel_cocktail, spot_reference)
+        spot_eur_mwh = _align_series_index(spot_eur_mwh, spot_index)
+        frame["spot_eur_mwh"] = spot_eur_mwh.reindex(common_index)
     for generation_column, fuel in GENERATION_COLUMNS_BY_FUEL.items():
         try:
             generation = _aggregate_regional_series_mw(df_30min, area_list, generation_column)
@@ -1159,8 +1505,9 @@ def identify_price_setters(
         demand_gw = row["demand_gw"]
         if pd.notna(demand_gw) and demand_gw < 0:
             demand_gw = 0.0
-        demand_unit = find_marginal_unit_by_demand(merit_order, demand_gw)
-        price_unit = find_marginal_unit_by_price(merit_order, row["spot_eur_mwh"])
+        demand_unit = find_marginal_unit_by_demand(merit_order, demand_gw, mc_column=mc_column)
+        spot_price = row["spot_jpy_kwh"] if mc_column == MC_COLUMN_JPY else row.get("spot_eur_mwh", np.nan)
+        price_unit = find_marginal_unit_by_price(merit_order, spot_price, mc_column=mc_column)
         demand_setters.append(None if demand_unit is None else demand_unit.get("fuel_class"))
         price_setters.append(None if price_unit is None else price_unit.get("fuel_class"))
         demand_units.append(None if demand_unit is None else demand_unit.get("plant_name_jp"))
@@ -1181,16 +1528,23 @@ def run_price_setter_configs(
     fuel_cocktail: pd.DataFrame | None = None,
     start: str | pd.Timestamp | None = None,
     end: str | pd.Timestamp | None = None,
+    cost_config: MarginalCostConfig | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Run multiple price-setter configurations in parallel for comparison."""
     configs = configs or default_price_setter_configs()
     spot = spot or data_loader.load_jepx_spot()
     df_30min = df_30min or data_loader.load_df30min()
     fuel_cocktail = fuel_cocktail or data_loader.load_japan_fuel_cocktail()
+    cost_config = cost_config or result.marginal_cost_config
 
     outputs: dict[str, pd.DataFrame] = {}
     for config in configs:
-        merit_order = merit_order_for_areas(result, areas=list(config.areas))
+        merit_order = merit_order_for_areas(
+            result,
+            areas=list(config.areas),
+            cost_config=cost_config,
+            df_30min=df_30min,
+        )
         outputs[config.name] = identify_price_setters(
             merit_order,
             config=config,
@@ -1201,6 +1555,62 @@ def run_price_setter_configs(
             end=end,
         )
     return outputs
+
+
+def run_parallel_stack_analysis(
+    result: ThermalStackResult,
+    analysis_configs: list[StackAnalysisConfig] | None = None,
+    spot: pd.DataFrame | None = None,
+    df_30min: pd.DataFrame | None = None,
+    fuel_cocktail: pd.DataFrame | None = None,
+    start: str | pd.Timestamp | None = None,
+    end: str | pd.Timestamp | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Run combined marginal-cost and price-setter scenarios in parallel."""
+    analysis_configs = analysis_configs or default_parallel_stack_configs()
+    spot = spot or data_loader.load_jepx_spot()
+    df_30min = df_30min or data_loader.load_df30min()
+    fuel_cocktail = fuel_cocktail or data_loader.load_japan_fuel_cocktail()
+
+    outputs: dict[str, pd.DataFrame] = {}
+    for analysis in analysis_configs:
+        merit_order = merit_order_for_areas(
+            result,
+            areas=list(analysis.price_setter.areas),
+            cost_config=analysis.cost,
+            df_30min=df_30min,
+        )
+        setters = identify_price_setters(
+            merit_order,
+            config=analysis.price_setter,
+            spot=spot,
+            df_30min=df_30min,
+            fuel_cocktail=fuel_cocktail,
+            start=start,
+            end=end,
+        )
+        setters["cost_mode"] = analysis.cost.name
+        setters["cost_methodology"] = analysis.cost.methodology
+        setters["lng_price_source"] = analysis.cost.lng_price_source
+        outputs[analysis.name] = setters
+    return outputs
+
+
+def summarize_parallel_stack_analysis(analysis_results: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Summarize marginal-fuel shares across combined parallel scenarios."""
+    summaries = []
+    for analysis_name, setters in analysis_results.items():
+        summary = summarize_price_setters(setters)
+        if summary.empty:
+            continue
+        summary["analysis"] = analysis_name
+        for column in ("cost_mode", "cost_methodology", "lng_price_source", "demand_basis", "areas"):
+            if column in setters.columns:
+                summary[column] = setters[column].iloc[0]
+        summaries.append(summary)
+    if not summaries:
+        return pd.DataFrame()
+    return pd.concat(summaries, ignore_index=True)
 
 
 def summarize_price_setter_configs(config_results: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -1233,7 +1643,8 @@ def compare_price_setter_demand_levels(config_results: dict[str, pd.DataFrame]) 
                 "demand_gw_min": setters["demand_gw"].min(),
                 "demand_gw_median": setters["demand_gw"].median(),
                 "demand_gw_max": setters["demand_gw"].max(),
-                "spot_eur_mwh_median": setters["spot_eur_mwh"].median(),
+                "spot_jpy_kwh_median": setters["spot_jpy_kwh"].median() if "spot_jpy_kwh" in setters.columns else np.nan,
+                "spot_eur_mwh_median": setters["spot_eur_mwh"].median() if "spot_eur_mwh" in setters.columns else np.nan,
             }
         )
     return pd.DataFrame(rows)

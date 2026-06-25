@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 THERMAL_STACK_EXPORT_DATASET_KEY = "thermal_stack"
+MMBTU_TO_MWH = 0.293071
+NEWC_MMBTU_PER_TONNE = 22.0
 
 _DATA_ROOT = Path(os.environ.get("THERMAL_STACK_DATA_ROOT", Path(__file__).resolve().parent))
 _WINDOWS_DATA_ROOT = Path(r"C:\Develop\data")
@@ -66,6 +69,70 @@ def load_df30min() -> pd.DataFrame:
     return frame.sort_index()
 
 
+def _resolve_jpyusd(frame: pd.DataFrame) -> pd.Series:
+    """Return JPY per USD series from cocktail columns."""
+    if "jpyusd" in frame.columns:
+        return pd.to_numeric(frame["jpyusd"], errors="coerce")
+    if "JPYUSD" in frame.columns:
+        return pd.to_numeric(frame["JPYUSD"], errors="coerce")
+    if "EURJPY" in frame.columns and "EURUSD" in frame.columns:
+        return pd.to_numeric(frame["EURJPY"], errors="coerce") / pd.to_numeric(frame["EURUSD"], errors="coerce")
+    raise ValueError("fuel cocktail must contain jpyusd, JPYUSD, or EURJPY/EURUSD.")
+
+
+def enrich_fuel_cocktail_jpy_kwh(cocktail: pd.DataFrame) -> pd.DataFrame:
+    """Add or refresh Japan fuel prices in JPY/kWh."""
+    frame = cocktail.copy()
+    jpyusd = _resolve_jpyusd(frame)
+
+    if "jcc_jpykwh" not in frame.columns and "jcc_usd_mmbtu" in frame.columns:
+        frame["jcc_jpykwh"] = (
+            pd.to_numeric(frame["jcc_usd_mmbtu"], errors="coerce")
+            * jpyusd
+            * MMBTU_TO_MWH
+            / 1000.0
+        )
+
+    if "jlc_jpykwh" not in frame.columns and "jlc_usd_mmbtu" in frame.columns:
+        frame["jlc_jpykwh"] = (
+            pd.to_numeric(frame["jlc_usd_mmbtu"], errors="coerce")
+            * jpyusd
+            * MMBTU_TO_MWH
+            / 1000.0
+        )
+
+    lng_usd_mmbtu = None
+    if "jkm_jpykwh" not in frame.columns:
+        if "jkm_usd_mmbtu" in frame.columns:
+            lng_usd_mmbtu = pd.to_numeric(frame["jkm_usd_mmbtu"], errors="coerce")
+        elif "JKM" in frame.columns:
+            lng_usd_mmbtu = pd.to_numeric(frame["JKM"], errors="coerce")
+        if lng_usd_mmbtu is not None:
+            frame["jkm_jpykwh"] = lng_usd_mmbtu * jpyusd * MMBTU_TO_MWH / 1000.0
+
+    if "ttf_jpykwh" not in frame.columns:
+        ttf_usd_mmbtu = None
+        if "ttf_usd_mmbtu" in frame.columns:
+            ttf_usd_mmbtu = pd.to_numeric(frame["ttf_usd_mmbtu"], errors="coerce")
+        elif "TTF" in frame.columns:
+            ttf_usd_mmbtu = pd.to_numeric(frame["TTF"], errors="coerce")
+        if ttf_usd_mmbtu is not None:
+            frame["ttf_jpykwh"] = ttf_usd_mmbtu * jpyusd * MMBTU_TO_MWH / 1000.0
+
+    if "coal_cif_jpykwh" not in frame.columns:
+        coal_usd_t = None
+        for column in ("coal_jpn_cif_usd_t", "coal_cif_usd_t", "newc"):
+            if column in frame.columns:
+                coal_usd_t = pd.to_numeric(frame[column], errors="coerce")
+                break
+        if coal_usd_t is not None:
+            frame["coal_cif_jpykwh"] = (
+                (coal_usd_t / NEWC_MMBTU_PER_TONNE) * jpyusd * MMBTU_TO_MWH / 1000.0
+            )
+
+    return frame
+
+
 def _normalize_fuel_cocktail(frame: pd.DataFrame) -> pd.DataFrame:
     """Normalize fuel cocktail columns for marginal-cost computation."""
     cocktail = frame.copy()
@@ -79,8 +146,10 @@ def _normalize_fuel_cocktail(frame: pd.DataFrame) -> pd.DataFrame:
         cocktail["coal_cif_eurmwh"] = cocktail["newc_eurmwh"]
 
     rename_map = {"EURUSD": "EURUSD", "eurusd": "EURUSD", "EURJPY": "EURJPY", "eurjpy": "EURJPY"}
-    cocktail = cocktail.rename(columns={source: target for source, target in rename_map.items() if source in cocktail.columns})
-    return cocktail
+    cocktail = cocktail.rename(
+        columns={source: target for source, target in rename_map.items() if source in cocktail.columns}
+    )
+    return enrich_fuel_cocktail_jpy_kwh(cocktail)
 
 
 def load_japan_fuel_cocktail() -> pd.DataFrame:
@@ -90,24 +159,224 @@ def load_japan_fuel_cocktail() -> pd.DataFrame:
 
 
 def load_unit_production() -> pd.DataFrame:
-    """Load HJKS unit production history."""
-    path = _resolve_data_file("Japan/unit_production.csv", "unit_production.csv")
-    return pd.read_csv(path)
+    """Load and normalize HJKS unit production from CSV.
+    
+    Returns
+    -------
+    pd.DataFrame
+        Columns: Plant Code, Market Area, Name, Unit Name, Type, Date,
+        Last Update, 48 half-hour columns (00:30 … 24:00), daily_kwh.
+        Half-hour values are in MW (converted from kWh).
+    """
+    from glob import glob
+    
+    # Mapping dictionaries for normalization
+    COLUMNS_JP_ENG = {
+        "エリア": "Market Area",
+        "発電所コード": "Plant Code",
+        "発電所名": "Name",
+        "ユニット名": "Unit Name",
+        "発電方式・燃種": "Type",
+        "対象日": "Date",
+        "日量[kWh]": "daily_kwh",
+        "更新日時": "Last Update",
+    }
+    
+    AREA_MAP_JP_EN = {
+        "北海道": "Hokkaido",
+        "東北": "Tohoku",
+        "東京": "Tokyo",
+        "中部": "Chubu",
+        "北陸": "Hokuriku",
+        "関西": "Kansai",
+        "中国": "Chugoku",
+        "四国": "Shikoku",
+        "九州": "Kyushu",
+        "沖縄": "Okinawa",
+    }
+    
+    FUEL_MAP_JP_EN = {
+        "水力": "Hydro",
+        "火力（ガス）": "LNG",
+        "火力（石炭）": "Coal",
+        "火力（石油）": "Oil",
+        "火力（ＬＮＧ）": "LNG",
+        "火力（その他）": "Other_Thermal",
+        "原子力": "Nuclear",
+        "太陽光": "Solar",
+        "風力": "Wind",
+        "地熱": "Geothermal",
+        "バイオマス": "Biomass",
+        "その他": "Other",
+    }
+    
+    # Find latest CSV file
+    for base in [_WINDOWS_DATA_ROOT, _DATA_ROOT]:
+        pattern = str(base / "HJKS" / "unit30min" / "ユニット別発電実績*.csv")
+        matches = sorted(glob(pattern), reverse=True)
+        if matches:
+            df = pd.read_csv(matches[0])
+            
+            # Rename columns to English
+            df = df.rename(columns=COLUMNS_JP_ENG)
+            
+            # Convert area and fuel type names
+            df["Market Area"] = df["Market Area"].map(AREA_MAP_JP_EN)
+            df["Type"] = df["Type"].map(FUEL_MAP_JP_EN)
+            
+            # Convert 30-min kWh columns to MW (kWh / 2 = MWh for 30min slot)
+            time_cols = [col for col in df.columns if col.endswith("[kWh]")]
+            for col in time_cols:
+                clean_col = col.replace("[kWh]", "")
+                df[clean_col] = df[col] / 2.0  # Convert 30-min kWh to MW
+                df = df.drop(columns=[col])
+            
+            # Convert daily_kwh to MWh
+            if "daily_kwh" in df.columns:
+                df["daily_kwh"] = df["daily_kwh"] / 1000.0
+            
+            # Parse date
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            
+            # Drop Okinawa as per jpPublicData convention
+            df = df[df["Market Area"] != "Okinawa"].copy()
+            
+            return df.reset_index(drop=True)
+    
+    raise FileNotFoundError(f"No HJKS unit production CSV files found in {_WINDOWS_DATA_ROOT / 'HJKS' / 'unit30min'} or {_DATA_ROOT / 'HJKS' / 'unit30min'}")
 
 
 def load_thermal_efficiency_registry() -> pd.DataFrame:
-    """Load thermal plant efficiency registry."""
-    path = _resolve_data_file("Japan/thermal_efficiency_registry.csv", "thermal_efficiency_registry.csv")
+    """Load thermal plant efficiency registry from MCP-catalogued Excel file."""
+    path = None
+    
+    # Try MCP paths first
+    for base in [_WINDOWS_DATA_ROOT, _DATA_ROOT]:
+        for filename in ["plant_efficiency.xlsx", "thermalRegistry.xlsx", "thermal_efficiency_registry.csv"]:
+            candidate = base / "Japan" / filename
+            if candidate.exists():
+                path = candidate
+                break
+        if path:
+            break
+    
+    if not path:
+        raise FileNotFoundError("Could not find thermal efficiency registry in Japan/ folder")
+    
+    if path.suffix == ".xlsx":
+        excel_file = pd.ExcelFile(path)
+        sheet = next(
+            (s for s in ["Efficiency_v2", "Efficiency", "thermal_stack"] if s in excel_file.sheet_names),
+            excel_file.sheet_names[0]
+        )
+        return pd.read_excel(path, sheet_name=sheet)
     return pd.read_csv(path)
 
 
 def load_nuclear_registry() -> pd.DataFrame:
-    """Load nuclear plant registry."""
-    path = _resolve_data_file("Japan/nuclear_registry.csv", "nuclear_registry.csv")
+    """Load nuclear plant registry from MCP-catalogued Excel file."""
+    path = None
+    
+    # Try MCP paths first
+    for base in [_WINDOWS_DATA_ROOT, _DATA_ROOT]:
+        for filename in ["japan_nuclear_registry.xlsx", "nuclearRegistry.xlsx", "nuclear_registry.csv"]:
+            candidate = base / "Japan" / filename
+            if candidate.exists():
+                path = candidate
+                break
+        if path:
+            break
+    
+    if not path:
+        raise FileNotFoundError("Could not find nuclear registry in Japan/ folder")
+    
+    if path.suffix == ".xlsx":
+        excel_file = pd.ExcelFile(path)
+        sheet = next(
+            (s for s in ["nuclear_registry", "Nuclear"] if s in excel_file.sheet_names),
+            excel_file.sheet_names[0]
+        )
+        return pd.read_excel(path, sheet_name=sheet)
     return pd.read_csv(path)
 
 
 def load_outages() -> pd.DataFrame:
-    """Load plant outage events."""
-    path = _resolve_data_file("Japan/outages.csv", "outages.csv")
-    return pd.read_csv(path)
+    """Load HJKS plant outage events from latest timestamped file."""
+    from glob import glob
+    
+    COLUMNS_JP_ENG = {
+        "エリア": "Market Area",
+        "発電事業者": "Operator",
+        "発電所コード": "Plant Code",
+        "発電所名": "Name",
+        "発電形式": "Type",
+        "ユニット名": "Unit Name",
+        "認可出力": "Capacity (GW)",
+        "停止区分": "StopType",
+        "種別": "OutageDetail",
+        "低下量": "Impact (GW)",
+        "停止日時": "From",
+        "復旧見通し": "Perspective",
+        "復旧予定日": "To",
+        "停止原因": "Reason",
+        "最終更新日時": "Publish Time",
+    }
+    
+    AREA_MAP_JP_EN = {
+        "北海道": "Hokkaido",
+        "東北": "Tohoku",
+        "東京": "Tokyo",
+        "中部": "Chubu",
+        "北陸": "Hokuriku",
+        "関西": "Kansai",
+        "中国": "Chugoku",
+        "四国": "Shikoku",
+        "九州": "Kyushu",
+        "沖縄": "Okinawa",
+    }
+    
+    FUEL_MAP_JP_EN = {
+        "水力": "Hydro",
+        "火力（ガス）": "LNG",
+        "火力（石炭）": "Coal",
+        "火力（石油）": "Oil",
+        "火力（ＬＮＧ）": "LNG",
+        "火力（その他）": "Other_Thermal",
+        "原子力": "Nuclear",
+        "太陽光": "Solar",
+        "風力": "Wind",
+        "地熱": "Geothermal",
+        "バイオマス": "Biomass",
+        "その他": "Other",
+    }
+    
+    # Find latest outages file
+    for base in [_WINDOWS_DATA_ROOT, _DATA_ROOT]:
+        pattern = str(base / "HJKS" / "outages" / "outages_*.csv")
+        matches = sorted(glob(pattern), reverse=True)
+        if matches:
+            # Try different encodings
+            for encoding in ["cp932", "shift-jis", "utf-8"]:
+                try:
+                    df = pd.read_csv(matches[0], encoding=encoding)
+                    
+                    # Rename columns to English
+                    df = df.rename(columns=COLUMNS_JP_ENG)
+                    
+                    # Convert area and fuel type names
+                    if "Market Area" in df.columns:
+                        df["Market Area"] = df["Market Area"].map(AREA_MAP_JP_EN)
+                    if "Type" in df.columns:
+                        df["Type"] = df["Type"].map(FUEL_MAP_JP_EN)
+                    
+                    # Parse dates
+                    for date_col in ["From", "To", "Publish Time"]:
+                        if date_col in df.columns:
+                            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                    
+                    return df
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            raise ValueError(f"Could not decode {matches[0]} with any supported encoding")
+    
+    raise FileNotFoundError(f"No HJKS outage files found in {_WINDOWS_DATA_ROOT / 'HJKS' / 'outages'} or {_DATA_ROOT / 'HJKS' / 'outages'}")
