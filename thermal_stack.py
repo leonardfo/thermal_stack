@@ -1002,7 +1002,8 @@ def merit_order_for_areas(
         areas=areas,
     )
     if cost_config is not None and cost_config.zero_mc_fuels:
-        df_30min = df_30min or data_loader.load_df30min()
+        if df_30min is None:
+            df_30min = data_loader.load_df30min()
         area_list = [areas] if isinstance(areas, str) else list(areas or [])
         merit_order = append_zero_mc_supply(
             merit_order,
@@ -1533,7 +1534,8 @@ def run_price_setter_configs(
     """Run multiple price-setter configurations in parallel for comparison."""
     configs = configs or default_price_setter_configs()
     spot = spot or data_loader.load_jepx_spot()
-    df_30min = df_30min or data_loader.load_df30min()
+    if df_30min is None:
+        df_30min = data_loader.load_df30min()
     fuel_cocktail = fuel_cocktail or data_loader.load_japan_fuel_cocktail()
     cost_config = cost_config or result.marginal_cost_config
 
@@ -1569,7 +1571,8 @@ def run_parallel_stack_analysis(
     """Run combined marginal-cost and price-setter scenarios in parallel."""
     analysis_configs = analysis_configs or default_parallel_stack_configs()
     spot = spot or data_loader.load_jepx_spot()
-    df_30min = df_30min or data_loader.load_df30min()
+    if df_30min is None:
+        df_30min = data_loader.load_df30min()
     fuel_cocktail = fuel_cocktail or data_loader.load_japan_fuel_cocktail()
 
     outputs: dict[str, pd.DataFrame] = {}
