@@ -71,6 +71,8 @@ GENERATION_COLUMNS_BY_FUEL = {
     "Coal": "gen_coa_act",
     "LNG": "gen_gas_act",
     "Oil": "gen_oil_act",
+    "Nuclear": "gen_nuc_act",
+    "Hydro": "gen_hyd_act",
 }
 
 DEMAND_BASIS_CONSUMPTION = "consumption"
@@ -89,8 +91,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ThermalStackConfig:
     """Configuration for the thermal stack pipeline."""
-    production_start: str | pd.Timestamp = "2024-03-01"
-    outage_start: str | pd.Timestamp = "2024-03-15"
+    production_start: str | pd.Timestamp = "2026-04-01"
+    outage_start: str | pd.Timestamp = "2026-03-15"
     forecast_start: str | pd.Timestamp | None = None
     delivery_month: str | pd.Timestamp | None = None
     export_excel: bool = True
@@ -147,6 +149,9 @@ class PriceSetterConfig:
 def default_price_setter_configs(
     include_kansai_fence: bool = True,
     include_tokyo: bool = False,
+    include_chubu: bool = False,
+    include_hokuriku: bool = False,
+    include_kansai: bool = False,
 ) -> list[PriceSetterConfig]:
     """Return default parallel price-setter configurations."""
     region_groups: list[tuple[str, tuple[str, ...], str]] = [
@@ -562,6 +567,8 @@ def compute_mc_eur(
         return np.nan
 
     eurusd = fuel_row.get("EURUSD", fuel_row.get("eurusd", np.nan))
+    eurjpy = fuel_row.get("EURJPY", fuel_row.get("eurjpy", np.nan))
+    
     if pd.isna(eurusd) or eurusd <= 0:
         return np.nan
 
